@@ -1,7 +1,8 @@
 use crate::state::SharedState;
 use serde_json::Value;
 use std::collections::BTreeSet;
-use std::ffi::OsString;
+use std::ffi::{OsStr, OsString};
+use std::path::Path;
 use std::time::Duration;
 use tokio::process::Command;
 use tokio::time::timeout;
@@ -15,24 +16,55 @@ fn tailscale_binary() -> OsString {
     {
         return explicit;
     }
-    // The macOS Tailscale app provides a CLI without necessarily adding it to PATH.
+    // On macOS the GUI (App Store/Standalone) daemon does not reliably
+    // support public Funnel ingress. Only the open-source CLI daemon is used.
     #[cfg(target_os = "macos")]
     {
-        let app_cli = "/Applications/Tailscale.app/Contents/MacOS/tailscale";
-        if std::path::Path::new(app_cli).is_file() {
-            return OsString::from(app_cli);
+        for candidate in [
+            "/opt/homebrew/opt/tailscale/bin/tailscale",
+            "/usr/local/opt/tailscale/bin/tailscale",
+        ] {
+            if Path::new(candidate).is_file() {
+                return OsString::from(candidate);
+            }
         }
     }
     OsString::from("tailscale")
 }
 
+fn socket_argument(path: &OsStr) -> Result<OsString, String> {
+    if !Path::new(path).is_absolute() {
+        return Err("CATDESK_TAILSCALE_SOCKET must be an absolute path".into());
+    }
+    let mut flag = OsString::from("--socket=");
+    flag.push(path);
+    Ok(flag)
+}
+
+fn configured_socket_argument() -> Result<Option<OsString>, String> {
+    match std::env::var_os("CATDESK_TAILSCALE_SOCKET").filter(|path| !path.is_empty()) {
+        Some(path) => socket_argument(&path).map(Some),
+        None => {
+            #[cfg(target_os = "macos")]
+            {
+                Err("macOS Funnel requires a separate open-source tailscaled in userspace mode; configure CATDESK_TAILSCALE_SOCKET".into())
+            }
+            #[cfg(not(target_os = "macos"))]
+            {
+                Ok(None)
+            }
+        }
+    }
+}
+
 async fn run_tailscale(args: &[&str]) -> Result<Vec<u8>, String> {
+    let mut command = Command::new(tailscale_binary());
+    if let Some(socket) = configured_socket_argument()? {
+        command.arg(socket);
+    }
     let output = timeout(
         TAILSCALE_COMMAND_TIMEOUT,
-        Command::new(tailscale_binary())
-            .env("TAILSCALE_BE_CLI", "1")
-            .args(args)
-            .output(),
+        command.env("TAILSCALE_BE_CLI", "1").args(args).output(),
     )
     .await
     .map_err(|_| "Tailscale CLI timed out; check the Tailscale daemon and login".to_string())?
@@ -188,7 +220,21 @@ pub async fn start(state: SharedState) -> Result<(), String> {
 
 #[cfg(test)]
 mod tests {
-    use super::{public_origin_from_status, select_safe_funnel_port};
+    use super::{public_origin_from_status, select_safe_funnel_port, socket_argument};
+    use std::ffi::OsStr;
+
+    #[test]
+    fn isolated_socket_requires_absolute_path() {
+        assert!(socket_argument(OsStr::new("relative/daemon.sock")).is_err());
+    }
+
+    #[test]
+    fn isolated_socket_is_passed_as_an_explicit_cli_argument() {
+        assert_eq!(
+            socket_argument(OsStr::new("/tmp/catdesk-tailscale/daemon.sock")),
+            Ok("--socket=/tmp/catdesk-tailscale/daemon.sock".into()),
+        );
+    }
 
     #[test]
     fn derives_url_from_running_status() {

@@ -7,11 +7,15 @@ public `https://<node>.<tailnet>.ts.net/<secret>/mcp` address.
 
 ## Prerequisites
 
-- A signed-in Tailscale client with the **`tailscale` CLI** accessible to the
-  user running CatDesk. On macOS, CatDesk also detects the CLI inside
-  `/Applications/Tailscale.app/Contents/MacOS/tailscale`. If necessary, set
-  `CATDESK_TAILSCALE_BIN` to the approved executable (absolute path). Do not
-  point it at a shell script.
+- A signed-in **open-source `tailscaled`** instance with the `tailscale` CLI
+  accessible to the user running CatDesk. On macOS, the App Store/Standalone
+  GUI variants must **not** be used for Funnel; they may report `Funnel on`
+  while failing external TLS. Keep the GUI client untouched and run a separate
+  userspace `tailscaled` instance on a private Unix socket instead.
+- On macOS set the absolute `CATDESK_TAILSCALE_SOCKET` to that isolated Unix
+  socket. `CATDESK_TAILSCALE_BIN` may also select an approved CLI executable;
+  otherwise the Homebrew executable is detected automatically. Do not point
+  the binary setting at a shell script.
 - MagicDNS and HTTPS enabled for your tailnet, with Funnel authorized for
   this specific node in the Tailscale admin console. Tailscale may require
   interactive account authorization at initial setup.
@@ -22,6 +26,43 @@ public `https://<node>.<tailnet>.ts.net/<secret>/mcp` address.
 
 No additional ngrok account/token and no new host port forwarding are needed.
 Do **not** replace the existing live CatDesk binary during initial tests.
+
+## macOS: isolated userspace Tailscale (without touching the GUI VPN)
+
+Use the Homebrew **formula** with no global symlinks/services, then run the
+CLI-only daemon as the signed-in user. This provides a separate Tailscale node,
+so standard public HTTPS port 443 is available without changing Tailscale Serve
+routes on the existing Mac node. No TUN device, additional VPN or VPS is used.
+
+```bash
+brew install --formula --skip-link tailscale
+umask 077
+mkdir -p "$HOME/.local/run/catdesk-funnel" "$HOME/.local/state/catdesk-funnel"
+chmod 700 "$HOME/.local/run/catdesk-funnel" "$HOME/.local/state/catdesk-funnel"
+SOCKET="$HOME/.local/run/catdesk-funnel/daemon.sock"
+
+# Run in a separate Terminal or a dedicated user LaunchAgent.
+/opt/homebrew/opt/tailscale/bin/tailscaled \
+  --tun=userspace-networking \
+  --socket="$SOCKET" \
+  --statedir="$HOME/.local/state/catdesk-funnel" \
+  --port=0
+
+# In another Terminal; login may require interactive approval.
+/opt/homebrew/opt/tailscale/bin/tailscale --socket="$SOCKET" up \
+  --hostname=catdesk-mcp --accept-dns=false --accept-routes=false --ssh=false
+
+# For the CatDesk process AND its background router subprocess:
+export CATDESK_TAILSCALE_SOCKET="$SOCKET"
+export CATDESK_TAILSCALE_BIN=/opt/homebrew/opt/tailscale/bin/tailscale
+```
+
+Do not use `sudo brew services start tailscale`: that launches a different
+system-wide daemon and can interfere with an existing VPN client. The daemon's
+socket may have mode `0666` by design, so the **parent directory must stay
+`0700`**. Protect the state directory (node identity and credentials) as well.
+Configure a user LaunchAgent if the Tailscale node must survive logouts and
+restarts, but do not automatically enable Funnel for unrelated services.
 
 ## Choose the transport
 
@@ -44,7 +85,8 @@ other clients are live or the local server has started.
 
 ## What CatDesk executes
 
-After choosing Tailscale, CatDesk:
+After choosing Tailscale, CatDesk (on macOS via the configured private
+`--socket=<path>` CLI flag):
 
 1. Calls `tailscale status --json` to confirm the local daemon reports a
    Running state and returns a valid MagicDNS `*.ts.net` hostname.
@@ -68,7 +110,8 @@ substitute for a ChatGPT custom connector.
   `http://127.0.0.1:3200/<slug>`; it must report
   `tunnelProvider=tailscale`, `tunnelRunning=true`, and
   `router=true`. Keep the slug private.
-- Inspect `tailscale funnel status` on the **same Tailscale host**. Ensure
+- Inspect `tailscale --socket="$CATDESK_TAILSCALE_SOCKET" funnel status`
+  on the **isolated Tailscale node**, not on the GUI client. Ensure
   it forwards to the correct local port and did not overwrite a different
   existing Serve/Funnel rule. Nonstandard public ports (10000/8443) may not
   be supported by all remote MCP clients; verify the exact endpoint in
@@ -79,8 +122,10 @@ substitute for a ChatGPT custom connector.
 - Confirm externally that clients without the secret slug cannot invoke
   tools, and rotate the old MCP slug during cutover if it was exposed.
 
-Only after these checks, arrange a controlled replacement of the production
-CatDesk binary and stop the old ngrok tunnel. Do not switch production
+Build the fork with `cargo build --release --locked` and test the resulting
+`target/release/catdesk`; `npm install -g catdesk` installs the **upstream**
+implementation, not this fork. Only after the checks above, arrange a controlled
+replacement of the production CatDesk binary and stop the old ngrok tunnel. Do not switch production
 CatDesk, Teplo, any existing Tailscale gateway, or other running services
 as part of development.
 
