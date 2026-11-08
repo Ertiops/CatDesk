@@ -6,9 +6,10 @@ use std::io::{self, Read, Write};
 use std::net::{IpAddr, Ipv4Addr, SocketAddr, TcpListener, TcpStream};
 use std::path::{Path, PathBuf};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
+#[cfg(test)]
 use uuid::Uuid;
 
-use crate::state::user_home_dir;
+use crate::state::{TunnelProvider, user_home_dir};
 
 pub const ROUTER_PORT: u16 = 3200;
 pub const WORKER_PORT_START: u16 = 3201;
@@ -208,10 +209,28 @@ fn registration_status(registration: &WorkspaceRegistration) -> RegistrationStat
         return RegistrationStatus::Uncertain;
     }
     let mut response = Vec::new();
-    if stream.take(64 * 1024).read_to_end(&mut response).is_err() {
-        return RegistrationStatus::Uncertain;
+    let read_result = stream.take(64 * 1024).read_to_end(&mut response);
+    let body_offset = response.windows(4).position(|bytes| bytes == b"\r\n\r\n");
+    // On macOS a peer may reset its socket *after* sending a complete HTTP
+    // response. A complete foreign/non-CatDesk response is positive evidence
+    // of stale registration; don't treat it as an inconclusive transport error.
+    if read_result.is_err() {
+        let Some(offset) = body_offset else {
+            return RegistrationStatus::Uncertain;
+        };
+        let headers = std::str::from_utf8(&response[..offset]).unwrap_or("");
+        let content_length = headers.lines().find_map(|line| {
+            let (name, value) = line.split_once(':')?;
+            name.trim()
+                .eq_ignore_ascii_case("content-length")
+                .then(|| value.trim().parse::<usize>().ok())
+                .flatten()
+        });
+        if !content_length.is_some_and(|len| response.len().saturating_sub(offset + 4) >= len) {
+            return RegistrationStatus::Uncertain;
+        }
     }
-    let Some(body_offset) = response.windows(4).position(|bytes| bytes == b"\r\n\r\n") else {
+    let Some(body_offset) = body_offset else {
         return RegistrationStatus::Stale;
     };
     let Ok(body) = serde_json::from_slice::<Value>(&response[body_offset + 4..]) else {
@@ -773,7 +792,7 @@ pub fn session_id_from_request(body: &Value) -> Option<&str> {
         .filter(|session| !session.is_empty())
 }
 
-pub async fn router_is_running(mcp_slug: &str) -> bool {
+pub async fn router_is_running(mcp_slug: &str, provider: TunnelProvider) -> bool {
     if mcp_slug.trim().is_empty() {
         return false;
     }
@@ -792,7 +811,8 @@ pub async fn router_is_running(mcp_slug: &str) -> bool {
     response.json::<Value>().await.ok().is_some_and(|value| {
         value.get("name").and_then(Value::as_str) == Some("CatDesk")
             && value.get("router").and_then(Value::as_bool) == Some(true)
-            && value.get("ngrokRunning").and_then(Value::as_bool) == Some(true)
+            && value.get("tunnelProvider").and_then(Value::as_str) == Some(provider.label())
+            && value.get("tunnelRunning").and_then(Value::as_bool) == Some(true)
     })
 }
 

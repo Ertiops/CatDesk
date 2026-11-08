@@ -27,8 +27,8 @@ use crate::devtools::DevtoolsBridge;
 use crate::mcp::{self, JsonRpcRequest, WIDGET_PAYLOAD_META_KEY};
 use crate::state::{
     AgentsPathMode, FlowBootstrapWidget, FlowDirection, ServerUiEvent, SharedState, ShowDetailMode,
-    TokenStatsLayout, UsageTotals, parse_seed_hex, save_agents_path_mode, save_show_detail_mode,
-    save_token_stats_layout,
+    TokenStatsLayout, TunnelProvider, UsageTotals, parse_seed_hex, save_agents_path_mode,
+    save_show_detail_mode, save_token_stats_layout,
 };
 use crate::workspace_router;
 
@@ -1034,8 +1034,16 @@ async fn health(State(s): State<ServerState>) -> Json<Value> {
         "workspaceCanonical": std::path::Path::new(&app.workspace_root)
             .canonicalize().unwrap_or_else(|_| std::path::PathBuf::from(&app.workspace_root))
             .to_string_lossy().to_string(),
-        "ngrokRunning": app.ngrok_running,
-        "ngrokUrl": app.ngrok_url,
+        "tunnelProvider": app.tunnel_provider.label(),
+        "tunnelRunning": app.tunnel_running,
+        "tunnelUrl": app.tunnel_url,
+        // Legacy keys stay for backwards compatibility with older clients.
+        "ngrokRunning": app.tunnel_provider == TunnelProvider::Ngrok && app.tunnel_running,
+        "ngrokUrl": if app.tunnel_provider == TunnelProvider::Ngrok {
+            app.tunnel_url.as_deref()
+        } else {
+            None
+        },
         "router": app.workspace_router,
         "pid": std::process::id(),
     }))
@@ -1663,8 +1671,8 @@ mod tests {
         )
         .unwrap();
         app.workspace_router = true;
-        app.ngrok_running = true;
-        app.ngrok_url = Some("https://example.ngrok.app".into());
+        app.tunnel_running = true;
+        app.tunnel_url = Some("https://example.ngrok.app".into());
         let (events, _rx) = unbounded_channel();
         let state = ServerState {
             app: Arc::new(Mutex::new(app)),
@@ -3436,7 +3444,7 @@ mod tests {
         )
         .expect("create router app state");
         app.workspace_router = true;
-        app.ngrok_url = Some("https://router.example".into());
+        app.tunnel_url = Some("https://router.example".into());
         let router_slug = app.mcp_slug.clone();
         let (ui_tx, _ui_rx) = unbounded_channel();
         let server_state = ServerState {
@@ -3941,7 +3949,7 @@ async fn route_workspace_tool_call(
             app.workspace_router,
             app.port,
             app.mcp_path(),
-            app.ngrok_url.clone(),
+            app.tunnel_url.clone(),
             app.show_detail_mode,
         )
     };
@@ -4225,7 +4233,7 @@ async fn post_mcp_inner(
         set_catdesk_as_co_author,
         handoff_enabled,
         sandbox_enabled,
-        ngrok_url,
+        tunnel_url,
         mcp_path,
         partner_binagotchy_seed,
         app_show_detail_mode,
@@ -4239,7 +4247,7 @@ async fn post_mcp_inner(
             app.set_catdesk_as_co_author,
             app.handoff_enabled,
             app.sandbox_enabled,
-            app.ngrok_url.clone(),
+            app.tunnel_url.clone(),
             app.mcp_path(),
             app.partner_binagotchy_seed.clone(),
             app.show_detail_mode,
@@ -4273,7 +4281,7 @@ async fn post_mcp_inner(
         &req,
         &workspace_root,
         mascot_seed,
-        ngrok_url.as_deref(),
+        tunnel_url.as_deref(),
         mode,
         tool_mode,
         set_catdesk_as_co_author,
@@ -4315,7 +4323,7 @@ async fn post_mcp_inner(
             attach_history_usage(&mut resp.result, &usage_totals);
             attach_catdesk_instruction_actions(
                 &mut resp.result,
-                ngrok_url.as_deref(),
+                tunnel_url.as_deref(),
                 &mcp_path,
                 mascot_seed,
                 partner_binagotchy_seed.as_deref(),
