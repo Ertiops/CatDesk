@@ -6,7 +6,7 @@ use reqwest::Url;
 pub async fn start(state: SharedState) -> Result<(), String> {
     let (port, mcp_path) = {
         let app = state.lock().await;
-        if app.ngrok_running {
+        if app.tunnel_running {
             return Err("ngrok is already running".into());
         }
         (app.port, app.mcp_path())
@@ -50,8 +50,8 @@ pub async fn start(state: SharedState) -> Result<(), String> {
             Err(e) if e.is_cancelled() => return,
             Err(e) => app.log("ERROR", format!("ngrok tunnel join failed: {e}")),
         }
-        app.ngrok_running = false;
-        app.ngrok_url = None;
+        app.tunnel_running = false;
+        app.tunnel_url = None;
         app.remote_connected = false;
         app.last_remote_activity_ms = None;
     });
@@ -59,8 +59,8 @@ pub async fn start(state: SharedState) -> Result<(), String> {
     {
         let mut app = state.lock().await;
         app.ngrok_task = Some(watcher);
-        app.ngrok_running = true;
-        app.ngrok_url = Some(url.clone());
+        app.tunnel_running = true;
+        app.tunnel_url = Some(url.clone());
         app.log("INFO", "ngrok SDK tunnel started".into());
         app.log("INFO", format!("ngrok URL: {url}"));
         app.log("INFO", format!("MCP Server URL: {url}{mcp_path}"));

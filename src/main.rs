@@ -16,6 +16,7 @@ mod process_runner;
 mod server;
 mod startup;
 mod state;
+mod tailscale;
 mod theme;
 mod workspace_router;
 mod workspace_tools;
@@ -37,10 +38,10 @@ use ratatui::{
 use state::{
     AppState, FLOW_ANIM_CELLS, FlowAnimKind, FlowAnimSegment, FlowDirection, FlowLane,
     GPT_5_6_AND_EARLIER_USAGE_BUCKET, LogEntry, Mode, ServerUiEvent, SharedState, ShowDetailMode,
-    ToolMode, UiLanguage, UsageTotals, WidgetCornerStyle, app_config_path, flow_anim_lit_count,
-    load_app_config, load_macos_terminal_profile, load_ngrok_authtoken, load_ngrok_domain,
-    local_now, save_macos_terminal_profile, save_ngrok_authtoken, save_ngrok_domain,
-    save_widget_corner_style, user_home_dir,
+    ToolMode, TunnelProvider, UiLanguage, UsageTotals, WidgetCornerStyle, app_config_path,
+    flow_anim_lit_count, load_app_config, load_macos_terminal_profile, load_ngrok_authtoken,
+    load_ngrok_domain, local_now, save_macos_terminal_profile, save_ngrok_authtoken,
+    save_ngrok_domain, save_widget_corner_style, user_home_dir,
 };
 use std::collections::HashMap;
 use std::io::{Write, stdout};
@@ -1315,8 +1316,8 @@ fn active_bootstrap_status_flow<'a>(app: &'a AppState, now_millis: u128) -> Opti
 }
 
 fn should_show_connect_guide(app: &AppState, now_millis: u128) -> bool {
-    let both_running = app.server_running && app.ngrok_running;
-    let has_url = app.ngrok_url.is_some();
+    let both_running = app.server_running && app.tunnel_running;
+    let has_url = app.tunnel_url.is_some();
     let visible_flow_count = app
         .flows
         .iter()
@@ -1451,7 +1452,7 @@ fn build_animation_snapshot(app: &AppState) -> Vec<String> {
         let closing = flow.closing_started_ms.is_some();
         let lane_active = closing
             || !flow.anim_queue.is_empty()
-            || (app.server_running && app.ngrok_running && app.remote_connected);
+            || (app.server_running && app.tunnel_running && app.remote_connected);
         let direction = Some(flow_direction(Some(flow), now_millis)).filter(|_| lane_active);
         let phase = flow_phase(flow, now_millis);
         let lit = flow_lit_count(Some(flow), now_millis, FLOW_ROW_CELLS);
@@ -1790,8 +1791,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             let _ = child.start_kill();
         }
         app.server_running = false;
-        app.ngrok_running = false;
-        app.ngrok_url = None;
+        app.tunnel_running = false;
+        app.tunnel_url = None;
         app.remote_connected = false;
         app.last_remote_activity_ms = None;
     }
@@ -1827,16 +1828,16 @@ async fn prepare_shared_workspace_router(state: SharedState) -> std::io::Result<
     .await
     .map_err(std::io::Error::other)??;
 
-    let mcp_slug = {
+    let (mcp_slug, tunnel_provider) = {
         let mut app = state.lock().await;
         if let Some(mcp_slug) = load_app_config()?.mcp_slug {
             app.mcp_slug = mcp_slug;
         }
         app.persist_state_with_log();
-        app.mcp_slug.clone()
+        (app.mcp_slug.clone(), app.tunnel_provider)
     };
 
-    if let Err(error) = ensure_background_router(&mcp_slug).await {
+    if let Err(error) = ensure_background_router(&mcp_slug, tunnel_provider).await {
         drop(client);
         drop(start_lock);
         return Err(error);
@@ -1850,6 +1851,7 @@ async fn prepare_shared_workspace_router(state: SharedState) -> std::io::Result<
 
     let heartbeat_workspace = workspace_root.clone();
     let heartbeat_mcp_slug = mcp_slug.clone();
+    let heartbeat_provider = tunnel_provider;
     let heartbeat_state = state.clone();
     let heartbeat = tokio::spawn(async move {
         let mut interval = tokio::time::interval(Duration::from_secs(5));
@@ -1872,17 +1874,21 @@ async fn prepare_shared_workspace_router(state: SharedState) -> std::io::Result<
                     .ok()
             }
             .await;
-            let (connected, ngrok_url) = router_health
+            let (connected, tunnel_url) = router_health
                 .as_ref()
                 .map(|health| {
                     (
                         health.get("router").and_then(serde_json::Value::as_bool) == Some(true)
                             && health
-                                .get("ngrokRunning")
+                                .get("tunnelProvider")
+                                .and_then(serde_json::Value::as_str)
+                                == Some(heartbeat_provider.label())
+                            && health
+                                .get("tunnelRunning")
                                 .and_then(serde_json::Value::as_bool)
                                 == Some(true),
                         health
-                            .get("ngrokUrl")
+                            .get("tunnelUrl")
                             .and_then(serde_json::Value::as_str)
                             .map(str::to_owned),
                     )
@@ -1890,8 +1896,8 @@ async fn prepare_shared_workspace_router(state: SharedState) -> std::io::Result<
                 .unwrap_or((false, None));
             {
                 let mut app = heartbeat_state.lock().await;
-                app.ngrok_running = connected;
-                app.ngrok_url = if connected { ngrok_url } else { None };
+                app.tunnel_running = connected;
+                app.tunnel_url = if connected { tunnel_url } else { None };
             }
             if !connected
                 && let Some(start_lock) =
@@ -1901,7 +1907,7 @@ async fn prepare_shared_workspace_router(state: SharedState) -> std::io::Result<
                         .and_then(Result::ok)
             {
                 let _start_lock = start_lock;
-                let _ = ensure_background_router(&heartbeat_mcp_slug).await;
+                let _ = ensure_background_router(&heartbeat_mcp_slug, heartbeat_provider).await;
             }
         }
     });
@@ -1923,8 +1929,8 @@ async fn prepare_shared_workspace_router(state: SharedState) -> std::io::Result<
     Ok(())
 }
 
-async fn ensure_background_router(mcp_slug: &str) -> std::io::Result<()> {
-    if workspace_router::router_is_running(mcp_slug).await {
+async fn ensure_background_router(mcp_slug: &str, provider: TunnelProvider) -> std::io::Result<()> {
+    if workspace_router::router_is_running(mcp_slug, provider).await {
         return Ok(());
     }
 
@@ -1936,14 +1942,14 @@ async fn ensure_background_router(mcp_slug: &str) -> std::io::Result<()> {
         .stderr(std::process::Stdio::null())
         .spawn()?;
 
-    // ngrok authentication and tunnel setup may take longer than five seconds.
+    // Public tunnel setup can take longer than five seconds.
     for _ in 0..300 {
-        if workspace_router::router_is_running(mcp_slug).await {
+        if workspace_router::router_is_running(mcp_slug, provider).await {
             return Ok(());
         }
         if let Some(status) = child.try_wait()? {
             return Err(std::io::Error::other(format!(
-                "CatDesk background router exited during startup ({status}); check ngrok credentials and domain"
+                "CatDesk background router exited during startup ({status}); check the selected tunnel provider and ensure port 3200 is free"
             )));
         }
         tokio::time::sleep(Duration::from_millis(100)).await;
@@ -1952,6 +1958,14 @@ async fn ensure_background_router(mcp_slug: &str) -> std::io::Result<()> {
         std::io::ErrorKind::TimedOut,
         "timed out waiting for the CatDesk background router to start",
     ))
+}
+
+async fn start_selected_tunnel(state: SharedState) -> Result<(), String> {
+    let provider = state.lock().await.tunnel_provider;
+    match provider {
+        TunnelProvider::Ngrok => ngrok::start(state).await,
+        TunnelProvider::Tailscale => tailscale::start(state).await,
+    }
 }
 
 async fn run_background_router() -> Result<(), Box<dyn std::error::Error>> {
@@ -1979,9 +1993,9 @@ async fn run_background_router() -> Result<(), Box<dyn std::error::Error>> {
         app.server_running = true;
         app.log("INFO", "Background workspace router started".into());
     }
-    if let Err(error) = ngrok::start(state.clone()).await {
+    if let Err(error) = start_selected_tunnel(state.clone()).await {
         return Err(std::io::Error::other(format!(
-            "background router could not start ngrok: {error}"
+            "background router could not configure public tunnel: {error}"
         ))
         .into());
     }
@@ -1999,7 +2013,7 @@ async fn run_background_router() -> Result<(), Box<dyn std::error::Error>> {
         .with_graceful_shutdown(async move {
             loop {
                 tokio::time::sleep(Duration::from_millis(250)).await;
-                if !state_for_shutdown.lock().await.ngrok_running {
+                if !state_for_shutdown.lock().await.tunnel_running {
                     break;
                 }
                 let has_clients =
@@ -2044,8 +2058,8 @@ async fn run_background_router() -> Result<(), Box<dyn std::error::Error>> {
         handle.abort();
     }
     app.server_running = false;
-    app.ngrok_running = false;
-    app.ngrok_url = None;
+    app.tunnel_running = false;
+    app.tunnel_url = None;
     Ok(())
 }
 
@@ -2106,14 +2120,18 @@ async fn run_app(
         }
     }
 
-    let continue_run = run_ngrok_auth_setup(terminal, state.clone()).await?;
-    if !continue_run {
-        return Ok(());
-    }
+    // Tailscale uses the locally signed-in CLI, not ngrok credentials.
+    // ngrok setup screens remain available for the default transport.
+    if state.lock().await.tunnel_provider == TunnelProvider::Ngrok {
+        let continue_run = run_ngrok_auth_setup(terminal, state.clone()).await?;
+        if !continue_run {
+            return Ok(());
+        }
 
-    let continue_run = run_ngrok_domain_setup(terminal, state.clone()).await?;
-    if !continue_run {
-        return Ok(());
+        let continue_run = run_ngrok_domain_setup(terminal, state.clone()).await?;
+        if !continue_run {
+            return Ok(());
+        }
     }
 
     prepare_shared_workspace_router(state.clone()).await?;
@@ -3413,6 +3431,7 @@ mod tests {
                     false,
                     "test-slug",
                     None,
+                    super::TunnelProvider::Ngrok,
                     &super::UsageTotals::default(),
                     0,
                     false,
@@ -4237,7 +4256,7 @@ async fn run_settings(
         themes.iter().position(|t| t.id == app.theme).unwrap_or(0)
     };
     let total_rows =
-        themes.len() + tool_modes.len() + show_detail_modes.len() + widget_corner_styles.len() + 6;
+        themes.len() + tool_modes.len() + show_detail_modes.len() + widget_corner_styles.len() + 7;
 
     loop {
         let (
@@ -4251,6 +4270,7 @@ async fn run_settings(
             handoff_enabled,
             mcp_slug,
             ngrok_domain,
+            tunnel_provider,
         ) = {
             let app = state.lock().await;
             (
@@ -4264,6 +4284,7 @@ async fn run_settings(
                 app.handoff_enabled,
                 app.mcp_slug.clone(),
                 app.ngrok_domain.clone(),
+                app.tunnel_provider,
             )
         };
         terminal.draw(|f| {
@@ -4279,6 +4300,7 @@ async fn run_settings(
                 handoff_enabled,
                 &mcp_slug,
                 ngrok_domain.as_deref(),
+                tunnel_provider,
                 &usage_totals,
                 selected_row,
                 confirm_reset_token_billing,
@@ -4316,6 +4338,7 @@ async fn run_settings(
                             + 4;
                         let connector_change_blocked = if selected_row == config_identity_row
                             || selected_row == config_identity_row + 1
+                            || selected_row == config_identity_row + 2
                         {
                             let current_workspace = state.lock().await.workspace_root.clone();
                             tokio::task::spawn_blocking(move || {
@@ -4462,6 +4485,21 @@ async fn run_settings(
                                         app.log("INFO", "Updated ngrok static domain".into());
                                         app.persist_state_with_log();
                                     }
+                                } else if selected_row == corner_end + 6 {
+                                    if connector_change_blocked || app.server_running {
+                                        app.log("WARN", "Stop active CatDesk workspaces before switching tunnel transport".into());
+                                    } else {
+                                        app.tunnel_provider = match app.tunnel_provider {
+                                            TunnelProvider::Ngrok => TunnelProvider::Tailscale,
+                                            TunnelProvider::Tailscale => TunnelProvider::Ngrok,
+                                        };
+                                        let provider_label = app.tunnel_provider.label();
+                                        app.log(
+                                            "INFO",
+                                            format!("Tunnel provider: {provider_label}"),
+                                        );
+                                        app.persist_state_with_log();
+                                    }
                                 }
                             }
                         }
@@ -4500,6 +4538,7 @@ fn draw_settings(
     handoff_enabled: bool,
     mcp_slug: &str,
     ngrok_domain: Option<&str>,
+    tunnel_provider: TunnelProvider,
     usage_totals: &UsageTotals,
     selected_row: usize,
     confirm_reset_token_billing: bool,
@@ -4983,6 +5022,38 @@ fn draw_settings(
         ),
         Style::default().fg(palette.muted_fg),
     )]));
+    let provider_row = domain_row + 1;
+    let provider_selected = provider_row == selected_row;
+    if provider_selected {
+        selected_line_idx = lines.len();
+    }
+    lines.push(Line::from(""));
+    lines.push(Line::from(vec![Span::styled(
+        format!(
+            " {} [{}] {}",
+            if provider_selected { ">" } else { " " },
+            provider_row + 1,
+            ui_language.text(
+                "Tunnel provider (Enter to toggle)",
+                "隧道提供者（Enter 切換）"
+            )
+        ),
+        if provider_selected {
+            Style::default()
+                .fg(palette.key_fg)
+                .add_modifier(Modifier::BOLD)
+        } else {
+            Style::default().fg(palette.primary_fg)
+        },
+    )]));
+    lines.push(Line::from(Span::styled(
+        format!(
+            "     [{}] (restart before switching)",
+            tunnel_provider.label()
+        ),
+        Style::default().fg(palette.muted_fg),
+    )));
+
     lines.push(Line::from(""));
     lines.push(Line::from(Span::styled(
         ui_language.text("  Token billing", "  Token 計費"),
@@ -5854,8 +5925,8 @@ async fn start_services(
         }
     }
 
-    if !workspace_worker && let Err(e) = ngrok::start(state.clone()).await {
-        state.lock().await.log("ERROR", format!("ngrok: {e}"));
+    if !workspace_worker && let Err(e) = start_selected_tunnel(state.clone()).await {
+        state.lock().await.log("ERROR", format!("tunnel: {e}"));
     }
 
     devtools_bridge
@@ -6362,7 +6433,7 @@ fn draw_ui(
         .unwrap_or_default()
         .as_millis();
 
-    let has_url = app.ngrok_url.is_some();
+    let has_url = app.tunnel_url.is_some();
     let visible_flow_count = app
         .flows
         .iter()
@@ -6409,7 +6480,7 @@ fn draw_ui(
     } else {
         ui_language.text("STOPPED", "已停止").into()
     };
-    let ngrok_status: &str = if app.ngrok_running {
+    let ngrok_status: &str = if app.tunnel_running {
         ui_language.text("RUNNING", "執行中")
     } else {
         ui_language.text("STOPPED", "已停止")
@@ -6530,10 +6601,10 @@ fn draw_ui(
             ),
         ]),
         Line::from(vec![
-            status_label("ngrok"),
+            status_label(app.tunnel_provider.label()),
             Span::styled(
                 ngrok_status,
-                Style::default().fg(if app.ngrok_running {
+                Style::default().fg(if app.tunnel_running {
                     palette.success_fg
                 } else {
                     palette.danger_fg
@@ -6738,7 +6809,7 @@ fn draw_ui(
                 let closing = flow.closing_started_ms.is_some();
                 let lane_active = closing
                     || !flow.anim_queue.is_empty()
-                    || (app.server_running && app.ngrok_running && app.remote_connected);
+                    || (app.server_running && app.tunnel_running && app.remote_connected);
                 let lane = lane_for(lane_active, Some(flow));
                 let mut row = vec![
                     Span::styled("    ", Style::default().fg(palette.muted_fg)),

@@ -103,6 +103,14 @@ Feel free to fork CatDesk and make your own version!
 - People who used up their Codex quota on the first few days after it reset (us🥺)
 - People who are working on web development and crawlers. (CatDesk enables ChatGPT Web to read elements and control your browser tab through chrome-devtools-mcp integration.)
 
+## Tailscale Funnel transport (this fork)
+
+The fork at [Ertiops/CatDesk](https://github.com/Ertiops/CatDesk) supports two tunnel transports: **ngrok** (default, backwards compatible) and **Tailscale Funnel** (free public HTTPS using your tailnet's `*.ts.net` DNS name). No purchased domain or VPS is required, and the MCP router/workers still run locally on the computer.
+
+On macOS, use a **separate open-source `tailscaled` userspace instance**, not the App Store/Standalone GUI VPN, for public Funnel ingress. Set `CATDESK_TAILSCALE_SOCKET` to its private Unix socket and optionally `CATDESK_TAILSCALE_BIN` to the approved CLI. The GUI client and its routes are preserved. Select **Settings → Tunnel provider → tailscale** before starting the CatDesk workspace (or set `tunnelProvider = "tailscale"` in `~/.catdesk/config.toml`). The daemon must already be authenticated and authorized for Funnel. CatDesk chooses an available HTTPS port (443, 10000, or 8443) and proxies to `http://127.0.0.1:3200` without overwriting other Serve/Funnel routes. The ngrok credentials are not used in this mode. Build this fork from source; the npm package is the upstream build.
+
+**Do not publish an active CatDesk instance until its MCP authentication, endpoint secrecy, and workspace permissions have been reviewed.** Funnel makes this URL reachable from the public internet. A successful CLI command does not prove ChatGPT can reach the server. See [full setup, verification, isolation and rollback instructions](docs/tailscale-funnel.md). The new implementation is experimental and must be tested before replacing an existing ngrok-based installation.
+
 # Quickstart
 
 > [!CAUTION]
@@ -196,7 +204,7 @@ cd ~/ProjectA
 catdesk
 ```
 
-The first command launches a **separate background router process** on port `3200`, hosting the single public connector and ngrok tunnel. The foreground CatDesk runs as a workspace worker on a port in `3201`–`3299`. Start CatDesk again from another project:
+The first command launches a **separate background router process** on port `3200`, hosting the single public connector through the selected **ngrok or Tailscale Funnel** transport. The foreground CatDesk runs as a workspace worker on a port in `3201`–`3299`. Start CatDesk again from another project:
 
 ```bash
 cd ~/ProjectB
@@ -207,7 +215,7 @@ The new foreground process also runs as a workspace worker on a free local port 
 
 For `tools/call`, CatDesk requires `_meta["openai/session"]`, an anonymized conversation identifier. The router's `tools/list` exposes CatDesk computer tools and discovers browser tools directly from `chrome-devtools-mcp` on the first discovery request, without consulting live workers or requiring a session ID. It starts `chrome-devtools-mcp` to fetch the actual tool schemas and caches successful discovery for the router process; a failed discovery returns `DevToolsDiscoveryUnavailable` and can be retried by a subsequent `tools/list` request. If only one live workspace is available, a new session binds there automatically, and multiple sessions may share that workspace. If multiple live workspaces are available, CatDesk pauses the first tool call and asks the user in TUI which workspace to bind. Later tool calls stay in the selected workspace. If the bound worker does not support a requested tool, it returns an error. The router never migrates a bound session. CatDesk stores the local workspace/session mapping in `~/.catdesk/workspace_id.toml`.
 
-This means Project A and Project B can stay isolated behind their own CatDesk workspace guards while sharing one ChatGPT connector. Restarting CatDesk inside a workspace clears that workspace's existing session bindings, so those conversations resolve a workspace again on their next tool call. The separate background router on port `3200` stays alive while workers are registered, and workers attempt to restore it if its tunnel disappears. Connector identity settings (MCP slug and ngrok domain) cannot be changed while other CatDesk workspaces are active. Quit the other workspaces first, then make the change before starting services. Other shared configuration changes are persisted across workspaces, but running workers keep their startup mode and browser capabilities until restarted.
+This means Project A and Project B can stay isolated behind their own CatDesk workspace guards while sharing one ChatGPT connector. Restarting CatDesk inside a workspace clears that workspace's existing session bindings, so those conversations resolve a workspace again on their next tool call. The separate background router on port `3200` stays alive while workers are registered, and workers attempt to restore it if its tunnel disappears. Connector identity/transport settings (MCP slug, ngrok domain, and tunnel provider) cannot be changed while other CatDesk workspaces are active. Quit the other workspaces first, then make the change before starting services. Other shared configuration changes are persisted across workspaces, but running workers keep their startup mode and browser capabilities until restarted.
 
 # Stack
 
@@ -218,7 +226,7 @@ This means Project A and Project B can stay isolated behind their own CatDesk wo
 | MCP protocolVersion | `2026-07-28` |
 | Server | Axum + Tokio |
 | TUI | Ratatui |
-| Tunnel | ngrok |
+| Tunnel | ngrok or Tailscale Funnel (this fork) |
 | Browser control | chrome-devtools-mcp |
 | Widget | HTML + JavaScript |
 | Distribution | npm |

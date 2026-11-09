@@ -383,9 +383,28 @@ pub fn save_widget_corner_style(style: WidgetCornerStyle) -> std::io::Result<Pat
     update_app_config(|config| config.widget_corner_style = style)
 }
 
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum TunnelProvider {
+    #[default]
+    Ngrok,
+    Tailscale,
+}
+
+impl TunnelProvider {
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::Ngrok => "ngrok",
+            Self::Tailscale => "tailscale",
+        }
+    }
+}
+
 #[derive(Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct AppConfig {
+    #[serde(default)]
+    pub tunnel_provider: TunnelProvider,
     pub ngrok_authtoken: Option<String>,
     pub mcp_slug: Option<String>,
     pub ngrok_domain: Option<String>,
@@ -430,6 +449,7 @@ fn default_sandbox_enabled() -> bool {
 impl Default for AppConfig {
     fn default() -> Self {
         Self {
+            tunnel_provider: TunnelProvider::Ngrok,
             ngrok_authtoken: None,
             mcp_slug: None,
             ngrok_domain: None,
@@ -714,13 +734,14 @@ pub struct AppState {
     pub show_detail_mode: ShowDetailMode,
     pub ui_language: UiLanguage,
     pub mcp_slug: String,
+    pub tunnel_provider: TunnelProvider,
     pub ngrok_domain: Option<String>,
     pub is_returning_user: bool,
     pub chatgpt_connector_refresh_required: bool,
     pub chatgpt_connector_revision: Option<u32>,
     pub server_running: bool,
-    pub ngrok_running: bool,
-    pub ngrok_url: Option<String>,
+    pub tunnel_running: bool,
+    pub tunnel_url: Option<String>,
     pub remote_connected: bool,
     pub last_remote_activity_ms: Option<u128>,
     pub devtools_running: bool,
@@ -1049,7 +1070,9 @@ impl AppState {
         if partner_binagotchy_seed.is_none() {
             mascot::archive_startup_mascot(mascot_seed)?;
         }
-        let is_returning_user = config.mcp_slug.is_some() && config.ngrok_domain.is_some();
+        let is_returning_user = config.mcp_slug.is_some()
+            && (config.tunnel_provider == TunnelProvider::Tailscale
+                || config.ngrok_domain.is_some());
         let stored_connector_revision = config.chatgpt_connector_revision;
         let chatgpt_connector_refresh_required = is_returning_user
             && stored_connector_revision.unwrap_or(0) < CURRENT_CHATGPT_CONNECTOR_REVISION;
@@ -1070,13 +1093,14 @@ impl AppState {
             show_detail_mode: config.show_detail_mode,
             ui_language: config.ui_language,
             mcp_slug,
+            tunnel_provider: config.tunnel_provider,
             ngrok_domain: config.ngrok_domain.clone(),
             is_returning_user,
             chatgpt_connector_refresh_required,
             chatgpt_connector_revision,
             server_running: false,
-            ngrok_running: false,
-            ngrok_url: None,
+            tunnel_running: false,
+            tunnel_url: None,
             remote_connected: false,
             last_remote_activity_ms: None,
             devtools_running: false,
@@ -1123,7 +1147,7 @@ impl AppState {
     }
 
     pub fn public_mcp_url(&self) -> Option<String> {
-        self.ngrok_url
+        self.tunnel_url
             .as_ref()
             .map(|url| format!("{url}{}", self.mcp_path()))
     }
@@ -1150,6 +1174,9 @@ impl AppState {
         }
         if self.ngrok_domain != self.persisted_config.ngrok_domain {
             config.ngrok_domain = self.ngrok_domain.clone();
+        }
+        if self.tunnel_provider != self.persisted_config.tunnel_provider {
+            config.tunnel_provider = self.tunnel_provider;
         }
         config.last_started_version = Some(env!("CARGO_PKG_VERSION").to_string());
         if self.chatgpt_connector_revision != self.persisted_config.chatgpt_connector_revision {
@@ -1249,6 +1276,7 @@ impl AppState {
         self.show_detail_mode = config.show_detail_mode;
         self.ui_language = config.ui_language;
         self.ngrok_domain = config.ngrok_domain.clone();
+        self.tunnel_provider = config.tunnel_provider;
         self.chatgpt_connector_revision = config.chatgpt_connector_revision;
         self.partner_binagotchy_seed = config.partner_binagotchy_seed.clone();
         self.set_catdesk_as_co_author = config.set_catdesk_as_co_author;
@@ -2138,6 +2166,25 @@ toolCallCount = 1
 
         let _ = std::fs::remove_file(config_path);
         let _ = std::fs::remove_dir(workspace);
+    }
+
+    #[test]
+    fn old_config_defaults_to_ngrok_provider() {
+        let config: AppConfig =
+            toml::from_str("theme = 'dark'\nmode = 'computer'\ntoolMode = 'multiTools'")
+                .expect("parse old config without tunnel provider");
+        assert_eq!(config.tunnel_provider, TunnelProvider::Ngrok);
+    }
+
+    #[test]
+    fn config_accepts_tailscale_transport() {
+        let config = AppConfig {
+            tunnel_provider: TunnelProvider::Tailscale,
+            ..AppConfig::default()
+        };
+        let encoded = toml::to_string(&config).expect("encode config");
+        let decoded: AppConfig = toml::from_str(&encoded).expect("decode config");
+        assert_eq!(decoded.tunnel_provider, TunnelProvider::Tailscale);
     }
 
     #[test]
