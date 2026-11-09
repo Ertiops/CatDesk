@@ -405,6 +405,8 @@ impl TunnelProvider {
 pub struct AppConfig {
     #[serde(default)]
     pub tunnel_provider: TunnelProvider,
+    #[serde(default)]
+    pub tailscale_socket: Option<String>,
     pub ngrok_authtoken: Option<String>,
     pub mcp_slug: Option<String>,
     pub ngrok_domain: Option<String>,
@@ -450,6 +452,7 @@ impl Default for AppConfig {
     fn default() -> Self {
         Self {
             tunnel_provider: TunnelProvider::Ngrok,
+            tailscale_socket: None,
             ngrok_authtoken: None,
             mcp_slug: None,
             ngrok_domain: None,
@@ -477,6 +480,11 @@ impl Default for AppConfig {
 
 impl AppConfig {
     fn normalized(mut self) -> Self {
+        self.tailscale_socket = self
+            .tailscale_socket
+            .take()
+            .map(|value| value.trim().to_string())
+            .filter(|value| !value.is_empty());
         self.ngrok_authtoken = self
             .ngrok_authtoken
             .take()
@@ -846,6 +854,21 @@ pub fn load_ngrok_domain() -> std::io::Result<Option<String>> {
 
 pub fn save_ngrok_domain(domain: &str) -> std::io::Result<PathBuf> {
     update_app_config(|config| config.ngrok_domain = Some(domain.to_string()))
+}
+
+/// Set a private Unix-socket path for the selected Tailscale CLI daemon.
+/// An empty value restores automatic discovery (or the environment override).
+pub fn save_tailscale_socket(path: &str) -> std::io::Result<PathBuf> {
+    let path = path.trim();
+    if !path.is_empty() && (!Path::new(path).is_absolute() || path.chars().any(char::is_control)) {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            "Tailscale socket must be an absolute path without control characters",
+        ));
+    }
+    update_app_config(|config| {
+        config.tailscale_socket = (!path.is_empty()).then(|| path.to_string());
+    })
 }
 
 pub fn save_agents_path_mode(mode: AgentsPathMode) -> std::io::Result<PathBuf> {
@@ -2185,6 +2208,20 @@ toolCallCount = 1
         let encoded = toml::to_string(&config).expect("encode config");
         let decoded: AppConfig = toml::from_str(&encoded).expect("decode config");
         assert_eq!(decoded.tunnel_provider, TunnelProvider::Tailscale);
+    }
+
+    #[test]
+    fn config_round_trips_tailscale_socket() {
+        let config = AppConfig {
+            tailscale_socket: Some(" /private/tmp/isolated-tailscale.sock ".into()),
+            ..AppConfig::default()
+        };
+        let text = toml::to_string(&config.normalized()).expect("encode config");
+        let restored: AppConfig = toml::from_str(&text).expect("decode config");
+        assert_eq!(
+            restored.tailscale_socket.as_deref(),
+            Some("/private/tmp/isolated-tailscale.sock")
+        );
     }
 
     #[test]

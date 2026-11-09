@@ -1,4 +1,4 @@
-use crate::state::SharedState;
+use crate::state::{SharedState, load_app_config, user_home_dir};
 use serde_json::Value;
 use std::collections::BTreeSet;
 use std::ffi::{OsStr, OsString};
@@ -41,21 +41,104 @@ fn socket_argument(path: &OsStr) -> Result<OsString, String> {
     Ok(flag)
 }
 
-fn configured_socket_argument() -> Result<Option<OsString>, String> {
-    match std::env::var_os("CATDESK_TAILSCALE_SOCKET").filter(|path| !path.is_empty()) {
-        Some(path) => socket_argument(&path).map(Some),
-        None => {
-            #[cfg(target_os = "macos")]
-            {
-                Err("macOS Funnel requires a separate open-source tailscaled in userspace mode; configure CATDESK_TAILSCALE_SOCKET".into())
-            }
-            #[cfg(not(target_os = "macos"))]
-            {
-                Ok(None)
-            }
-        }
+/// Explicit environment configuration takes precedence over the saved TUI
+/// setting. On macOS a private userspace daemon in the documented default
+/// location is discovered automatically; an App Store VPN is never selected.
+fn choose_socket_argument(
+    environment: Option<OsString>,
+    saved: Option<&str>,
+    default: Option<&Path>,
+) -> Result<Option<OsString>, String> {
+    if let Some(path) = environment.filter(|path| !path.is_empty()) {
+        return socket_argument(&path).map(Some);
+    }
+    if let Some(path) = saved.filter(|path| !path.trim().is_empty()) {
+        return socket_argument(OsStr::new(path.trim())).map(Some);
+    }
+    if let Some(path) = default.filter(|path| path.is_file() || path.exists()) {
+        return socket_argument(path.as_os_str()).map(Some);
+    }
+    #[cfg(target_os = "macos")]
+    {
+        Err("No private Tailscale socket found. Open Settings > Tailscale setup or run catdesk --tailscale-help".into())
+    }
+    #[cfg(not(target_os = "macos"))]
+    {
+        Ok(None)
     }
 }
+
+fn configured_socket_argument() -> Result<Option<OsString>, String> {
+    let config =
+        load_app_config().map_err(|error| format!("Cannot read CatDesk settings: {error}"))?;
+    #[cfg(target_os = "macos")]
+    let default = user_home_dir()
+        .ok()
+        .map(|home| home.join(".local/run/catdesk-funnel/daemon.sock"));
+    #[cfg(not(target_os = "macos"))]
+    let default: Option<std::path::PathBuf> = None;
+
+    choose_socket_argument(
+        std::env::var_os("CATDESK_TAILSCALE_SOCKET"),
+        config.tailscale_socket.as_deref(),
+        default.as_deref(),
+    )
+}
+
+pub struct ConnectionDiagnostics {
+    pub hostname: String,
+    pub active_funnel_ports: Vec<String>,
+}
+
+/// Read-only: interrogate the selected daemon, without changing Funnel routes.
+pub async fn diagnose() -> Result<ConnectionDiagnostics, String> {
+    let status = run_tailscale(&["status", "--json"]).await?;
+    let hostname = public_origin_from_status(&status)?;
+    let funnel = run_tailscale(&["funnel", "status", "--json"]).await?;
+    let config: Value = serde_json::from_slice(&funnel)
+        .map_err(|_| "Tailscale Funnel status returned invalid JSON".to_string())?;
+    let mut active_funnel_ports: Vec<String> = config
+        .get("AllowFunnel")
+        .and_then(Value::as_object)
+        .into_iter()
+        .flat_map(|funnel| funnel.iter())
+        .filter(|(_, allowed)| allowed.as_bool() == Some(true))
+        .filter_map(|(key, _)| advertised_port(key).map(|port| port.to_string()))
+        .collect();
+    active_funnel_ports.sort();
+    active_funnel_ports.dedup();
+    Ok(ConnectionDiagnostics {
+        hostname,
+        active_funnel_ports,
+    })
+}
+
+pub const SETUP_HELP: &str = r#"Tailscale is an optional CatDesk transport; ngrok remains available.
+
+macOS: install the open-source CLI (not another GUI VPN):
+  brew install --formula --skip-link tailscale
+
+Run a private userspace Tailscale daemon in a separate terminal:
+  umask 077
+  mkdir -p "$HOME/.local/run/catdesk-funnel" "$HOME/.local/state/catdesk-funnel"
+  chmod 700 "$HOME/.local/run/catdesk-funnel" "$HOME/.local/state/catdesk-funnel"
+  TS_BIN="$(brew --prefix tailscale)/bin"
+  SOCKET="$HOME/.local/run/catdesk-funnel/daemon.sock"
+  "$TS_BIN/tailscaled" --tun=userspace-networking \
+    --socket="$SOCKET" --statedir="$HOME/.local/state/catdesk-funnel"
+
+In a second terminal, authorize the new Tailscale node:
+  TS_BIN="$(brew --prefix tailscale)/bin"
+  "$TS_BIN/tailscale" --socket="$HOME/.local/run/catdesk-funnel/daemon.sock" \
+    up --hostname=catdesk-mcp --accept-dns=false --accept-routes=false --ssh=false
+
+In CatDesk: press [s] on the mode screen, select Tunnel provider > tailscale.
+The default socket is auto-detected; configure a custom path in Settings if needed.
+Choose "Tailscale setup guide & connection check" to inspect without changing Funnel.
+Run catdesk --tailscale-check for a non-interactive status check.
+For persistent startup, configure a dedicated LaunchAgent (see docs/tailscale-funnel.md).
+Never share your full MCP secret URL. Funnel is public to the internet.
+"#;
 
 async fn run_tailscale(args: &[&str]) -> Result<Vec<u8>, String> {
     let mut command = Command::new(tailscale_binary());
@@ -220,7 +303,9 @@ pub async fn start(state: SharedState) -> Result<(), String> {
 
 #[cfg(test)]
 mod tests {
-    use super::{public_origin_from_status, select_safe_funnel_port, socket_argument};
+    use super::{
+        choose_socket_argument, public_origin_from_status, select_safe_funnel_port, socket_argument,
+    };
     use std::ffi::OsStr;
 
     #[test]
@@ -234,6 +319,31 @@ mod tests {
             socket_argument(OsStr::new("/tmp/catdesk-tailscale/daemon.sock")),
             Ok("--socket=/tmp/catdesk-tailscale/daemon.sock".into()),
         );
+    }
+
+    #[test]
+    fn persisted_socket_is_selected_without_environment_variable() {
+        assert_eq!(
+            choose_socket_argument(None, Some("/private/tmp/saved.sock"), None),
+            Ok(Some("--socket=/private/tmp/saved.sock".into())),
+        );
+    }
+
+    #[test]
+    fn explicit_environment_socket_overrides_saved_setting() {
+        assert_eq!(
+            choose_socket_argument(
+                Some("/private/tmp/environment.sock".into()),
+                Some("/private/tmp/saved.sock"),
+                None,
+            ),
+            Ok(Some("--socket=/private/tmp/environment.sock".into())),
+        );
+    }
+
+    #[test]
+    fn invalid_saved_socket_is_rejected() {
+        assert!(choose_socket_argument(None, Some("relative.sock"), None).is_err());
     }
 
     #[test]

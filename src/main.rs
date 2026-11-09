@@ -41,7 +41,7 @@ use state::{
     ToolMode, TunnelProvider, UiLanguage, UsageTotals, WidgetCornerStyle, app_config_path,
     flow_anim_lit_count, load_app_config, load_macos_terminal_profile, load_ngrok_authtoken,
     load_ngrok_domain, local_now, save_macos_terminal_profile, save_ngrok_authtoken,
-    save_ngrok_domain, save_widget_corner_style, user_home_dir,
+    save_ngrok_domain, save_tailscale_socket, save_widget_corner_style, user_home_dir,
 };
 use std::collections::HashMap;
 use std::io::{Write, stdout};
@@ -1686,6 +1686,23 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     if std::env::args().any(|arg| arg == "--background-router") {
         return run_background_router().await;
     }
+    if std::env::args().any(|arg| arg == "--tailscale-help") {
+        println!("{}", tailscale::SETUP_HELP);
+        return Ok(());
+    }
+    if std::env::args().any(|arg| arg == "--tailscale-check") {
+        let status = tailscale::diagnose().await.map_err(std::io::Error::other)?;
+        println!("Tailscale: connected ({})", status.hostname);
+        if status.active_funnel_ports.is_empty() {
+            println!("Funnel: no public HTTPS ports configured");
+        } else {
+            println!(
+                "Funnel: public HTTPS ports {}",
+                status.active_funnel_ports.join(", ")
+            );
+        }
+        return Ok(());
+    }
 
     let terminal_profile_enabled = macos_terminal_profile_enabled()?;
     match macos_terminal::maybe_relaunch_in_terminal_profile(terminal_profile_enabled) {
@@ -2102,6 +2119,21 @@ async fn run_app(
                     }
                     _ => continue,
                 };
+                // Before trying to start a public Tailscale connector, make
+                // sure the selected local daemon can actually be queried.
+                // A missing socket sends the user back to mode selection,
+                // where [s] opens Settings, rather than exiting after a delay.
+                let selected_provider = state.lock().await.tunnel_provider;
+                if selected_provider == TunnelProvider::Tailscale {
+                    if let Err(error) = tailscale::diagnose().await {
+                        state
+                            .lock()
+                            .await
+                            .log("WARN", format!("Tailscale not ready: {error}"));
+                        run_tailscale_setup(terminal, current_ui_language, current_theme).await?;
+                        continue;
+                    }
+                }
                 {
                     let mut app = state.lock().await;
                     app.mode = mode;
@@ -3432,6 +3464,7 @@ mod tests {
                     "test-slug",
                     None,
                     super::TunnelProvider::Ngrok,
+                    None,
                     &super::UsageTotals::default(),
                     0,
                     false,
@@ -3453,6 +3486,44 @@ mod tests {
                 "missing translated theme text: {expected}"
             );
         }
+    }
+
+    #[test]
+    fn settings_exposes_tailscale_socket_and_connection_help() {
+        let theme = super::theme::all()[0];
+        let mut terminal = Terminal::new(TestBackend::new(160, 50)).expect("create terminal");
+        let provider_section_end = super::theme::all().len()
+            + ToolMode::all().len()
+            + super::ShowDetailMode::all().len()
+            + super::WidgetCornerStyle::all().len();
+        terminal
+            .draw(|frame| {
+                draw_settings(
+                    frame,
+                    &theme,
+                    ToolMode::MultiTools,
+                    super::ShowDetailMode::Expanded,
+                    super::WidgetCornerStyle::Rounded,
+                    UiLanguage::English,
+                    false,
+                    false,
+                    false,
+                    "test-slug",
+                    None,
+                    super::TunnelProvider::Tailscale,
+                    None,
+                    &super::UsageTotals::default(),
+                    provider_section_end + 8,
+                    false,
+                    false,
+                )
+            })
+            .expect("render Tailscale settings");
+        let text = terminal_buffer_text(&terminal);
+        assert!(
+            text.contains("Tailscale setup guide & connection check")
+                && text.contains("Tailscale Unix socket")
+        );
     }
 
     #[test]
@@ -4238,6 +4309,101 @@ async fn run_prompt(
     }
 }
 
+/// Show a non-mutating transport setup guide and live connection diagnostics.
+/// Nothing in this screen installs Tailscale or opens a public Funnel.
+async fn run_tailscale_setup(
+    terminal: &mut Terminal<CrosstermBackend<std::io::Stdout>>,
+    ui_language: UiLanguage,
+    current_theme: &theme::ThemeDef,
+) -> Result<(), Box<dyn std::error::Error>> {
+    let mut diagnosis = tailscale::diagnose().await;
+    loop {
+        terminal.draw(|f| {
+            let palette = current_theme.palette;
+            let mut lines = vec![
+                Line::from(ui_language.text(
+                    "Tailscale is optional. ngrok configuration is not changed.",
+                    "Tailscale 是可選功能，不會修改 ngrok 設定。",
+                )),
+                Line::from(""),
+                Line::from(ui_language.text(
+                    "1. Install the open-source CLI (macOS):",
+                    "1. 安裝開源 CLI（macOS）：",
+                )),
+                Line::from("   brew install --formula --skip-link tailscale"),
+                Line::from(ui_language.text(
+                    "2. Run tailscaled in userspace mode on a private Unix socket.",
+                    "2. 在私有 Unix socket 上啟動 userspace tailscaled。",
+                )),
+                Line::from("   ~/.local/run/catdesk-funnel/daemon.sock"),
+                Line::from(ui_language.text(
+                    "3. Sign in that node using tailscale --socket=<path> up.",
+                    "3. 使用 tailscale --socket=<path> up 登入該節點。",
+                )),
+                Line::from(ui_language.text(
+                    "4. In Settings select tailscale; the default socket is found automatically.",
+                    "4. 在設定選擇 tailscale；預設 socket 會自動偵測。",
+                )),
+                Line::from(ui_language.text(
+                    "   To use a custom socket, configure its absolute path in Settings.",
+                    "   若使用自訂 socket，請在設定輸入絕對路徑。",
+                )),
+                Line::from(""),
+                Line::from("Full commands: catdesk --tailscale-help"),
+                Line::from("Detailed guide: docs/tailscale-funnel.md"),
+                Line::from(""),
+            ];
+            match &diagnosis {
+                Ok(status) => {
+                    lines.push(Line::from(Span::styled(
+                        format!("Connected: {}", status.hostname),
+                        Style::default().fg(palette.success_fg),
+                    )));
+                    if status.active_funnel_ports.is_empty() {
+                        lines.push(Line::from("Funnel: no public HTTPS ports configured"));
+                    } else {
+                        lines.push(Line::from(format!(
+                            "Funnel public HTTPS ports: {}",
+                            status.active_funnel_ports.join(", ")
+                        )));
+                    }
+                }
+                Err(error) => lines.push(Line::from(Span::styled(
+                    format!("Not ready: {error}"),
+                    Style::default().fg(palette.danger_fg),
+                ))),
+            }
+            lines.push(Line::from(""));
+            lines.push(Line::from(ui_language.text(
+                "[c] Recheck    [Enter/Esc] Back",
+                "[c] 重新檢查    [Enter/Esc] 返回",
+            )));
+            let view = Paragraph::new(lines).wrap(Wrap { trim: false }).block(
+                Block::default()
+                    .title(
+                        ui_language
+                            .text(" Tailscale Setup & Diagnostics ", " Tailscale 設定與診斷 "),
+                    )
+                    .borders(Borders::ALL)
+                    .border_style(Style::default().fg(palette.border_fg)),
+            );
+            f.render_widget(view, f.area());
+        })?;
+        if event::poll(Duration::from_millis(100))?
+            && let Event::Key(key) = event::read()?
+            && key.kind == KeyEventKind::Press
+        {
+            match key.code {
+                KeyCode::Char('c') | KeyCode::Char('C') => {
+                    diagnosis = tailscale::diagnose().await;
+                }
+                KeyCode::Enter | KeyCode::Esc | KeyCode::Char('q') => return Ok(()),
+                _ => {}
+            }
+        }
+    }
+}
+
 async fn run_settings(
     terminal: &mut Terminal<CrosstermBackend<std::io::Stdout>>,
     state: SharedState,
@@ -4249,6 +4415,9 @@ async fn run_settings(
     let mut current_widget_corner_style = load_app_config()
         .map(|config| config.widget_corner_style)
         .unwrap_or_default();
+    let mut current_tailscale_socket = load_app_config()
+        .map(|config| config.tailscale_socket)
+        .unwrap_or_default();
     let mut confirm_reset_token_billing = false;
     let mut confirm_disable_sandbox = false;
     let mut selected_row = {
@@ -4256,7 +4425,7 @@ async fn run_settings(
         themes.iter().position(|t| t.id == app.theme).unwrap_or(0)
     };
     let total_rows =
-        themes.len() + tool_modes.len() + show_detail_modes.len() + widget_corner_styles.len() + 7;
+        themes.len() + tool_modes.len() + show_detail_modes.len() + widget_corner_styles.len() + 9;
 
     loop {
         let (
@@ -4301,6 +4470,7 @@ async fn run_settings(
                 &mcp_slug,
                 ngrok_domain.as_deref(),
                 tunnel_provider,
+                current_tailscale_socket.as_deref(),
                 &usage_totals,
                 selected_row,
                 confirm_reset_token_billing,
@@ -4339,6 +4509,7 @@ async fn run_settings(
                         let connector_change_blocked = if selected_row == config_identity_row
                             || selected_row == config_identity_row + 1
                             || selected_row == config_identity_row + 2
+                            || selected_row == config_identity_row + 3
                         {
                             let current_workspace = state.lock().await.workspace_root.clone();
                             tokio::task::spawn_blocking(move || {
@@ -4500,6 +4671,40 @@ async fn run_settings(
                                         );
                                         app.persist_state_with_log();
                                     }
+                                } else if selected_row == corner_end + 7 {
+                                    if connector_change_blocked || app.server_running {
+                                        app.log("WARN", "Stop active CatDesk workspaces before changing the Tailscale socket".into());
+                                        continue;
+                                    }
+                                    drop(app);
+                                    if let Some(path) = run_prompt(
+                                        terminal,
+                                        current_ui_language.text(
+                                            "Tailscale Unix socket (absolute path, empty = auto-detect):",
+                                            "Tailscale Unix socket（絕對路徑，留空自動偵測）：",
+                                        ),
+                                        current_tailscale_socket.as_deref().unwrap_or(""),
+                                    )
+                                    .await?
+                                    {
+                                        match save_tailscale_socket(&path) {
+                                            Ok(_) => {
+                                                current_tailscale_socket = (!path.trim().is_empty()).then(|| path.trim().to_string());
+                                                state.lock().await.log("INFO", "Updated Tailscale socket setting".into());
+                                            }
+                                            Err(error) => {
+                                                state.lock().await.log("ERROR", format!("Invalid Tailscale socket: {error}"));
+                                            }
+                                        }
+                                    }
+                                } else if selected_row == corner_end + 8 {
+                                    drop(app);
+                                    run_tailscale_setup(
+                                        terminal,
+                                        current_ui_language,
+                                        current_theme,
+                                    )
+                                    .await?;
                                 }
                             }
                         }
@@ -4539,6 +4744,7 @@ fn draw_settings(
     mcp_slug: &str,
     ngrok_domain: Option<&str>,
     tunnel_provider: TunnelProvider,
+    tailscale_socket: Option<&str>,
     usage_totals: &UsageTotals,
     selected_row: usize,
     confirm_reset_token_billing: bool,
@@ -5000,7 +5206,10 @@ fn draw_settings(
             " {} [{}] {}",
             domain_marker,
             domain_row + 1,
-            ui_language.text("Set ngrok static domain", "設定 ngrok 固定網域")
+            ui_language.text(
+                "Set ngrok static domain (ngrok only)",
+                "設定 ngrok 固定網域（僅 ngrok）"
+            )
         ),
         domain_name_style,
     )]));
@@ -5050,6 +5259,80 @@ fn draw_settings(
         format!(
             "     [{}] (restart before switching)",
             tunnel_provider.label()
+        ),
+        Style::default().fg(palette.muted_fg),
+    )));
+
+    let socket_row = provider_row + 1;
+    let socket_selected = socket_row == selected_row;
+    if socket_selected {
+        selected_line_idx = lines.len();
+    }
+    lines.push(Line::from(vec![Span::styled(
+        format!(
+            " {} [{}] {}",
+            if socket_selected { ">" } else { " " },
+            socket_row + 1,
+            ui_language.text(
+                "Tailscale Unix socket (Enter to configure)",
+                "Tailscale Unix socket（Enter 設定）"
+            )
+        ),
+        if socket_selected {
+            Style::default()
+                .fg(palette.key_fg)
+                .add_modifier(Modifier::BOLD)
+        } else {
+            Style::default().fg(palette.primary_fg)
+        },
+    )]));
+    let socket_label =
+        if std::env::var_os("CATDESK_TAILSCALE_SOCKET").is_some_and(|value| !value.is_empty()) {
+            ui_language
+                .text("[environment override active]", "[環境變數覆蓋中]")
+                .to_string()
+        } else if let Some(path) = tailscale_socket {
+            format!("[{path}]")
+        } else {
+            ui_language
+                .text(
+                    "[auto: ~/.local/run/catdesk-funnel/daemon.sock]",
+                    "[自動：~/.local/run/catdesk-funnel/daemon.sock]",
+                )
+                .to_string()
+        };
+    lines.push(Line::from(Span::styled(
+        format!("     {socket_label}"),
+        Style::default().fg(palette.muted_fg),
+    )));
+
+    let help_row = socket_row + 1;
+    let help_selected = help_row == selected_row;
+    if help_selected {
+        selected_line_idx = lines.len();
+    }
+    lines.push(Line::from(vec![Span::styled(
+        format!(
+            " {} [{}] {}",
+            if help_selected { ">" } else { " " },
+            help_row + 1,
+            ui_language.text(
+                "Tailscale setup guide & connection check",
+                "Tailscale 安裝說明與連線檢查"
+            )
+        ),
+        if help_selected {
+            Style::default()
+                .fg(palette.key_fg)
+                .add_modifier(Modifier::BOLD)
+        } else {
+            Style::default().fg(palette.primary_fg)
+        },
+    )]));
+    lines.push(Line::from(Span::styled(
+        ui_language.text(
+            "     Read-only status check; no Funnel changes",
+            "     唯讀連線檢查；不會更改 Funnel",
         ),
         Style::default().fg(palette.muted_fg),
     )));
