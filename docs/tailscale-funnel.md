@@ -12,10 +12,14 @@ public `https://<node>.<tailnet>.ts.net/<secret>/mcp` address.
   GUI variants must **not** be used for Funnel; they may report `Funnel on`
   while failing external TLS. Keep the GUI client untouched and run a separate
   userspace `tailscaled` instance on a private Unix socket instead.
-- On macOS set the absolute `CATDESK_TAILSCALE_SOCKET` to that isolated Unix
-  socket. `CATDESK_TAILSCALE_BIN` may also select an approved CLI executable;
-  otherwise the Homebrew executable is detected automatically. Do not point
-  the binary setting at a shell script.
+- On macOS, CatDesk **automatically finds** the isolated daemon at
+  `~/.local/run/catdesk-funnel/daemon.sock`. For custom locations use
+  **Settings → Tailscale Unix socket** to save an absolute path; you no longer
+  need to edit TOML or set environment variables manually.
+- `CATDESK_TAILSCALE_SOCKET` remains an optional runtime override (takes
+  precedence over the saved setting). `CATDESK_TAILSCALE_BIN` can override the
+  CLI executable; otherwise the Homebrew CLI is detected automatically.
+  Do not point the binary setting at an untrusted script.
 - MagicDNS and HTTPS enabled for your tailnet, with Funnel authorized for
   this specific node in the Tailscale admin console. Tailscale may require
   interactive account authorization at initial setup.
@@ -36,25 +40,27 @@ routes on the existing Mac node. No TUN device, additional VPN or VPS is used.
 
 ```bash
 brew install --formula --skip-link tailscale
+TS_BIN="$(brew --prefix tailscale)/bin"
 umask 077
 mkdir -p "$HOME/.local/run/catdesk-funnel" "$HOME/.local/state/catdesk-funnel"
 chmod 700 "$HOME/.local/run/catdesk-funnel" "$HOME/.local/state/catdesk-funnel"
 SOCKET="$HOME/.local/run/catdesk-funnel/daemon.sock"
 
 # Run in a separate Terminal or a dedicated user LaunchAgent.
-/opt/homebrew/opt/tailscale/bin/tailscaled \
+"$TS_BIN/tailscaled" \
   --tun=userspace-networking \
   --socket="$SOCKET" \
   --statedir="$HOME/.local/state/catdesk-funnel" \
   --port=0
 
 # In another Terminal; login may require interactive approval.
-/opt/homebrew/opt/tailscale/bin/tailscale --socket="$SOCKET" up \
+"$TS_BIN/tailscale" --socket="$SOCKET" up \
   --hostname=catdesk-mcp --accept-dns=false --accept-routes=false --ssh=false
 
-# For the CatDesk process AND its background router subprocess:
-export CATDESK_TAILSCALE_SOCKET="$SOCKET"
-export CATDESK_TAILSCALE_BIN=/opt/homebrew/opt/tailscale/bin/tailscale
+# No export is required when using the default socket above.
+# For a custom socket use CatDesk Settings -> Tailscale Unix socket.
+# Optional runtime override for custom deployments:
+# export CATDESK_TAILSCALE_SOCKET="$SOCKET"
 ```
 
 Do not use `sudo brew services start tailscale`: that launches a different
@@ -66,18 +72,39 @@ restarts, but do not automatically enable Funnel for unrelated services.
 
 ## Choose the transport
 
-In CatDesk's initial **Settings**, select **Tunnel provider (Enter to
-toggle)**, set `tailscale`, leave Settings, and then select a control mode.
-This option is saved in `~/.catdesk/config.toml`:
+From CatDesk's initial mode screen press **S** to open **Settings**.
+Choose **Tunnel provider (Enter to toggle)** and set it to `tailscale`.
+When the daemon uses the documented default socket, no other configuration
+is needed. Otherwise select **Tailscale Unix socket (Enter to configure)** and
+enter its absolute socket path. Choose **Tailscale setup guide & connection
+check** to see step-by-step instructions and check the connection *without
+changing any tunnel*. Press **C** to recheck and Enter/Esc to return.
+When choosing a control mode with Tailscale selected, CatDesk performs the
+same read-only preflight. If the daemon is unavailable it shows the guide and
+returns to the mode screen so you can reopen Settings; it does not silently
+start a broken router or modify the working ngrok setup.
+
+There are also non-interactive commands:
+
+```bash
+catdesk --tailscale-help    # setup guide, no TTY needed
+catdesk --tailscale-check   # daemon/DNS/Funnel status, read-only
+```
+
+The transport option is saved in `~/.catdesk/config.toml`:
 
 ```toml
 tunnelProvider = "tailscale"
+# Optional custom socket when not using the auto-detected default:
+# tailscaleSocket = "/absolute/path/to/daemon.sock"
 ```
 
 The default is `ngrok`, maintaining compatibility with existing CatDesk
 configurations. The ngrok token and domain, if already configured, are left
 unchanged but are unused in Tailscale mode. Do not store Tailscale credentials
-in this file.
+in this file. The `tailscaleSocket` setting is just a path, not a credential.
+A custom `CATDESK_TAILSCALE_SOCKET` environment override wins over the saved
+path; remove that override to use the settings value.
 
 The selected provider is **not hot-swappable**: stop all CatDesk workspaces
 before switching and restart the router. Settings block the switch when
